@@ -1118,6 +1118,11 @@ func setupTestMCPServer(t *testing.T) (*httptest.Server, *fakeWorkerManager) {
 		sessionTimeout: time.Minute,
 		debug:          true,
 		store:          store,
+		// Tests exercise the full surface (including py_eval) so the
+		// production gate doesn't hide regressions in tier registration /
+		// removal lists.
+		enablePyEval: true,
+		bind:         "127.0.0.1",
 	}
 
 	mcpServer := mcp.NewServer(&mcp.Implementation{

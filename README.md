@@ -1,8 +1,18 @@
 # IDA Pilot
 
-Headless IDA Pro analysis server exposing 28 MCP tools. Designed for AI agents — tiered tool loading, multi-layer caching, batch operations, and compact payloads minimize token cost per turn.
+Headless IDA Pro analysis server exposing MCP tools (28 with `py_eval` enabled, 27 without). Designed for AI agents — tiered tool loading, multi-layer caching, batch operations, and compact payloads minimize token cost per turn.
 
 Go orchestrates sessions and caching. Python workers run IDA via idalib. Communication uses Connect RPC over TCP.
+
+## ⚠️ Security model — read before exposing the port
+
+IDA Pilot has **no built-in authentication**. The defaults are tuned for a single trusted MCP client on the same machine:
+
+- **Bound to `127.0.0.1` by default.** Only callers on the local host can reach it. Override with `--bind 0.0.0.0` (or `IDA_PILOT_BIND`) only if you are putting an authenticated reverse proxy in front.
+- **`Origin` / `Host` validation** on every request when bound to loopback — blocks DNS-rebinding and browser cross-origin attacks.
+- **`py_eval` is OFF by default.** It runs arbitrary Python inside the IDA worker (full host filesystem + network access). Enable explicitly with `--enable-py-eval` (or `IDA_PILOT_ENABLE_PY_EVAL=1`) and treat the resulting endpoint as an RCE primitive — anyone who can reach the port can execute code.
+
+In short: **a fresh `./bin/ida-pilot` run is safe to leave on; opening the port to the network or enabling `py_eval` is an explicit choice and your responsibility to protect.**
 
 ## Architecture
 
@@ -79,10 +89,10 @@ Agents start with 3 tools. More appear as needed — the schema payload per turn
 | Tier | Trigger | Tools | Purpose |
 |------|---------|-------|---------|
 | 0 | Server boot | 3 | `open_binary`, `list_sessions`, `get_cached_output` |
-| 1 | Binary opened | +20 = 23 | Read, query, composite, analysis, context & cross-session tools |
-| 2 | First analysis | +5 = 28 | Write, annotate, and import tools |
+| 1 | Binary opened | +19 = 22 | Read, query, composite, analysis, context & cross-session tools |
+| 2 | First analysis | +5 = 27 | Write, annotate, and import tools |
 
-When the last session closes, tools demote back to Tier 0.
+When the last session closes, tools demote back to Tier 0. Adding `--enable-py-eval` registers one more Tier-1 tool, taking the full surface to 28.
 
 ### Composite Tools
 
@@ -173,7 +183,7 @@ The surface is intentionally small: related operations are consolidated behind a
 | `watch_auto_analysis` | Stream auto-analysis progress |
 | `set_analysis_note` / `get_analysis_context` | Server-side context tracking for state recovery |
 | `prune_context` | Clear cached outputs + noted-function caches to free memory |
-| `py_eval` | Execute Python in IDA; invalidates caches after the call (`read_only=true` to keep them warm) |
+| `py_eval` *(opt-in)* | Execute Python in IDA — registered only with `--enable-py-eval`. Invalidates caches after each call (`read_only=true` to keep them warm). See [Security model](#%EF%B8%8F-security-model--read-before-exposing-the-port). |
 
 ### Write & import (Tier 2)
 
@@ -190,34 +200,40 @@ The surface is intentionally small: related operations are consolidated behind a
 ### CLI Flags
 
 ```
+--bind              Bind interface (default 127.0.0.1; use 0.0.0.0 only behind an auth proxy)
 --port              HTTP port (default: from config.json)
 --config            Config file path (default: config.json)
 --worker            Python worker script path
 --max-sessions      Max concurrent sessions
 --session-timeout   Session idle timeout (e.g. 4h)
 --debug             Verbose logging
+--enable-py-eval    Register the py_eval tool (arbitrary Python in the IDA worker — RCE primitive)
 ```
 
 ### Environment Variables
 
 ```
+IDA_PILOT_BIND=127.0.0.1
 IDA_PILOT_PORT=17300
 IDA_PILOT_SESSION_TIMEOUT_MIN=240
 IDA_PILOT_MAX_SESSIONS=10
 IDA_PILOT_WORKER=/path/to/worker.py
 IDA_PILOT_DEBUG=1
+IDA_PILOT_ENABLE_PY_EVAL=0
 ```
 
 ### config.json
 
 ```json
 {
+  "bind": "127.0.0.1",
   "port": 17300,
   "session_timeout_minutes": 240,
   "max_concurrent_sessions": 4,
-  "database_directory": "/path/to/databases",
+  "database_directory": "./databases",
   "python_worker_path": "python/worker/server.py",
-  "debug": true
+  "debug": false,
+  "enable_py_eval": false
 }
 ```
 

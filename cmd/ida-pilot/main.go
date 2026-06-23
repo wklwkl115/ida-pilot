@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -20,12 +21,14 @@ import (
 )
 
 var (
-	configPath   = flag.String("config", "config.json", "Path to server config")
-	portFlag     = flag.Int("port", 0, "HTTP port (overrides config)")
-	pythonWorker = flag.String("worker", "", "Python worker script (overrides config)")
-	maxSessions  = flag.Int("max-sessions", 0, "Max concurrent sessions (overrides config)")
-	timeoutFlag  = flag.Duration("session-timeout", 0, "Session idle timeout (overrides config)")
-	debugFlag    = flag.Bool("debug", false, "Enable verbose debug logging")
+	configPath      = flag.String("config", "config.json", "Path to server config")
+	bindFlag        = flag.String("bind", "", "Bind interface (default 127.0.0.1; use 0.0.0.0 to expose externally)")
+	portFlag        = flag.Int("port", 0, "HTTP port (overrides config)")
+	pythonWorker    = flag.String("worker", "", "Python worker script (overrides config)")
+	maxSessions     = flag.Int("max-sessions", 0, "Max concurrent sessions (overrides config)")
+	timeoutFlag     = flag.Duration("session-timeout", 0, "Session idle timeout (overrides config)")
+	debugFlag       = flag.Bool("debug", false, "Enable verbose debug logging")
+	enablePyEvalFlg = flag.Bool("enable-py-eval", false, "Register the py_eval tool (arbitrary Python execution in the IDA worker — RCE primitive, off by default)")
 )
 
 func main() {
@@ -40,6 +43,9 @@ func main() {
 
 	server.ApplyEnvOverrides(&cfg)
 
+	if *bindFlag != "" {
+		cfg.Bind = *bindFlag
+	}
 	if *portFlag > 0 {
 		cfg.Port = *portFlag
 	}
@@ -58,6 +64,9 @@ func main() {
 	if *debugFlag {
 		cfg.Debug = true
 	}
+	if *enablePyEvalFlg {
+		cfg.EnablePyEval = true
+	}
 
 	// Validate configuration before starting server
 	if err := validateConfig(&cfg); err != nil {
@@ -73,6 +82,7 @@ func main() {
 	}
 
 	srv := server.New(registry, workers, logger, sessionTimeout, cfg.Debug, store)
+	srv.SetSecurity(cfg.Bind, cfg.EnablePyEval)
 
 	srv.RestoreSessions()
 
@@ -86,7 +96,7 @@ func main() {
 	srv.RegisterTools(mcpServer)
 	srv.PromoteIfSessions()
 
-	addr := fmt.Sprintf(":%d", cfg.Port)
+	addr := fmt.Sprintf("%s:%d", cfg.Bind, cfg.Port)
 	mux := srv.HTTPMux(mcpServer)
 
 	httpServer := &http.Server{
@@ -95,8 +105,14 @@ func main() {
 	}
 
 	logger.Printf("Listening on %s", addr)
-	logger.Printf("HTTP transport at http://localhost:%d/", cfg.Port)
-	logger.Printf("SSE transport at http://localhost:%d/sse", cfg.Port)
+	logger.Printf("HTTP transport at http://%s:%d/", cfg.Bind, cfg.Port)
+	logger.Printf("SSE transport at http://%s:%d/sse", cfg.Bind, cfg.Port)
+	if !isLoopbackBind(cfg.Bind) {
+		logger.Printf("⚠️  SECURITY: bound to non-loopback %q — server has no built-in auth. Put an authenticated reverse proxy in front, or revert to 127.0.0.1.", cfg.Bind)
+	}
+	if cfg.EnablePyEval {
+		logger.Printf("⚠️  SECURITY: py_eval is ENABLED — any client that can reach this port can execute arbitrary Python on the host (RCE primitive).")
+	}
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
@@ -127,6 +143,20 @@ func main() {
 	if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
 		logger.Fatal(err)
 	}
+}
+
+// isLoopbackBind reports whether the configured Bind address is a loopback
+// interface (127.0.0.0/8 or ::1). Used only to gate a security warning at
+// startup; the runtime check lives in internal/server/http.go.
+func isLoopbackBind(bind string) bool {
+	if bind == "" {
+		return true
+	}
+	ip := net.ParseIP(bind)
+	if ip != nil {
+		return ip.IsLoopback()
+	}
+	return bind == "localhost"
 }
 
 func validateConfig(cfg *server.Config) error {

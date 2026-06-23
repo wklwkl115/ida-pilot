@@ -29,13 +29,25 @@ const (
 )
 
 type Config struct {
+	// Bind is the interface address the HTTP server listens on. Defaults to
+	// "127.0.0.1" so a fresh run is reachable only by local clients. Set to
+	// "0.0.0.0" (and pair with an upstream auth proxy) to expose externally.
+	Bind                 string `json:"bind"`
 	Port                 int    `json:"port"`
 	SessionTimeoutMin    int    `json:"session_timeout_minutes"`
 	MaxConcurrentSession int    `json:"max_concurrent_sessions"`
 	DatabaseDirectory    string `json:"database_directory"`
 	PythonWorkerPath     string `json:"python_worker_path"`
 	Debug                bool   `json:"debug"`
+	// EnablePyEval gates the py_eval tool. Off by default — py_eval runs
+	// arbitrary Python inside the IDA worker (full filesystem / network
+	// access) and is an RCE primitive in the hands of any client that can
+	// reach the HTTP port.
+	EnablePyEval bool `json:"enable_py_eval"`
 }
+
+// DefaultBind is the loopback address used when no Bind value is configured.
+const DefaultBind = "127.0.0.1"
 
 type Server struct {
 	registry       *session.Registry
@@ -43,6 +55,8 @@ type Server struct {
 	logger         *log.Logger
 	sessionTimeout time.Duration
 	debug          bool
+	enablePyEval   bool // gates registration of the py_eval tool
+	bind           string
 	store          *session.Store
 	cacheMu        sync.Mutex
 	cache          map[string]*sessionCache
@@ -68,6 +82,14 @@ func New(registry *session.Registry, workers worker.Controller, logger *log.Logg
 	}
 }
 
+// SetSecurity configures the bind address (used by the Origin/Host middleware)
+// and the py_eval enablement flag. Call before RegisterTools so the tier
+// registration sees the final flag value.
+func (s *Server) SetSecurity(bind string, enablePyEval bool) {
+	s.bind = bind
+	s.enablePyEval = enablePyEval
+}
+
 func GetDefaultDBDir() string {
 	if xdgData := os.Getenv("XDG_DATA_HOME"); xdgData != "" {
 		return filepath.Join(xdgData, "ida-pilot", "sessions")
@@ -80,6 +102,7 @@ func GetDefaultDBDir() string {
 
 func LoadConfig(path string) (Config, error) {
 	cfg := Config{
+		Bind:                 DefaultBind,
 		Port:                 DefaultPort,
 		SessionTimeoutMin:    defaultSessionTimeoutMin,
 		MaxConcurrentSession: defaultMaxSessions,
@@ -106,6 +129,9 @@ func ensureConfigDefaults(cfg *Config) {
 	if cfg.Port == 0 {
 		cfg.Port = DefaultPort
 	}
+	if cfg.Bind == "" {
+		cfg.Bind = DefaultBind
+	}
 	if cfg.SessionTimeoutMin == 0 {
 		cfg.SessionTimeoutMin = defaultSessionTimeoutMin
 	}
@@ -118,6 +144,9 @@ func ensureConfigDefaults(cfg *Config) {
 }
 
 func ApplyEnvOverrides(cfg *Config) {
+	if val := os.Getenv("IDA_PILOT_BIND"); val != "" {
+		cfg.Bind = val
+	}
 	if val := os.Getenv("IDA_PILOT_PORT"); val != "" {
 		if p, err := strconv.Atoi(val); err == nil {
 			cfg.Port = p
@@ -141,9 +170,17 @@ func ApplyEnvOverrides(cfg *Config) {
 			cfg.Debug = parsed
 		}
 	}
+	if val := os.Getenv("IDA_PILOT_ENABLE_PY_EVAL"); val != "" {
+		if parsed, ok := parseBool(val); ok {
+			cfg.EnablePyEval = parsed
+		}
+	}
 }
 
-// Tool tier names for RemoveTools on demotion.
+// Tool tier names for RemoveTools on demotion. py_eval is appended at runtime
+// only when EnablePyEval is set; the SDK no-ops removal of an unregistered
+// tool either way, but keeping the slice honest avoids confusing the operator
+// when they read the codebase.
 var tier1ToolNames = []string{
 	"close_binary", "save_database",
 	"survey_binary", "analyze_function", "analyze_functions",
@@ -152,7 +189,14 @@ var tier1ToolNames = []string{
 	"query", "get_references", "search", "inspect",
 	"cross_reference", "cross_search",
 	"run_auto_analysis", "watch_auto_analysis", "get_session_progress",
-	"py_eval",
+}
+
+// tier1Tools returns the Tier-1 tool names, optionally including py_eval.
+func (s *Server) tier1Tools() []string {
+	if s.enablePyEval {
+		return append(append([]string{}, tier1ToolNames...), "py_eval")
+	}
+	return tier1ToolNames
 }
 
 var tier2ToolNames = []string{
@@ -187,7 +231,7 @@ func (s *Server) promoteToTier(target int) {
 	}
 	if target >= 1 && s.tier < 1 {
 		s.registerTier1()
-		s.logger.Printf("[Tools] promoted to tier 1 (read): %d tools", len(tier1ToolNames)+3)
+		s.logger.Printf("[Tools] promoted to tier 1 (read): %d tools", len(s.tier1Tools())+3)
 	}
 	if target >= 2 && s.tier < 2 {
 		s.registerTier2()
@@ -206,7 +250,7 @@ func (s *Server) demoteToTier0() {
 		s.mcpServer.RemoveTools(tier2ToolNames...)
 	}
 	if s.tier >= 1 {
-		s.mcpServer.RemoveTools(tier1ToolNames...)
+		s.mcpServer.RemoveTools(s.tier1Tools()...)
 	}
 	s.tier = 0
 	s.logger.Printf("[Tools] demoted to tier 0 (boot): 3 tools")
@@ -335,11 +379,17 @@ func (s *Server) registerTier1() {
 		Description: "Session load/analysis progress and readiness (stage, ready, auto_running). Poll after open_binary until ready=true.",
 	}, s.getSessionProgress)
 
-	// ── Escape hatches ──
-	addToolWithCache(s, m, &mcp.Tool{
-		Name:        "py_eval",
-		Description: "Execute Python in IDA. All ida_* modules available. Assign to 'result' to return data. Caches are invalidated after each call so later reads reflect any edits; set read_only=true for pure reads to keep caches warm.",
-	}, s.pyEval)
+	// ── Escape hatches (opt-in, RCE primitive) ──
+	// py_eval runs arbitrary Python in the IDA worker — full host filesystem
+	// and network access. Registered only when the operator passes
+	// --enable-py-eval / IDA_PILOT_ENABLE_PY_EVAL=1; otherwise it stays off
+	// the tool list entirely.
+	if s.enablePyEval {
+		addToolWithCache(s, m, &mcp.Tool{
+			Name:        "py_eval",
+			Description: "Execute Python in IDA. All ida_* modules available. Assign to 'result' to return data. Caches are invalidated after each call so later reads reflect any edits; set read_only=true for pure reads to keep caches warm.",
+		}, s.pyEval)
+	}
 }
 
 func (s *Server) registerTier2() {
