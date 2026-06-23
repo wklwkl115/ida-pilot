@@ -1,0 +1,57 @@
+# Build artifacts
+.gocache/
+bin/
+
+# Python
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Session state
+databases/
+
+# Agent / IDE local state (user-specific, do not ship)
+.claude/
+.codex/
+.agents/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDA database files
+*.i64
+*.idb
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+
+# IDA temporary files
+.$$$
+*.$$$
+
+# Server logs
+server_stdout.log
+server_stderr.log
+
+# Agent/tool scratch and stray artifacts
+.reasonix/
+.tmp/
+.until-done/
+context.md
+nul

@@ -1,0 +1,8 @@
+{
+  "port": 17300,
+  "session_timeout_minutes": 240,
+  "max_concurrent_sessions": 4,
+  "database_directory": "./databases",
+  "python_worker_path": "python/worker/server.py",
+  "debug": false
+}

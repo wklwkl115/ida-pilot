@@ -1,0 +1,36 @@
+min_version = "2025.10.0"
+
+[tools]
+go = "1.25.0"
+python = "3.12.10"
+
+[tasks.dev-check]
+description = "Fast local developer suite for the current Go scope"
+run = [
+  "go test ./internal/... ./ida/... -skip TestMCPToolGoldens"
+]
+
+[tasks.verify]
+description = "Release-readiness suite for the current scope"
+run = [
+  "go vet ./...",
+  "go test -count=1 ./internal/... ./ida/... -skip TestMCPToolGoldens",
+  "bash ./scripts/consistency.sh"
+]
+
+[tasks.affected]
+description = "Changed-file runner with a safe fallback to dev-check"
+run = "bash ./scripts/affected-check.sh"
+
+[tasks.ci-parity]
+description = "Check that local verify gate matches GitHub workflow"
+run = "bash ./scripts/ci-parity.sh"
+
+[tasks.list-gates]
+description = "Show the canonical local gates"
+run = "mise tasks ls"
+
+# ponytail: Go native caches stay enabled for fast local feedback; verify uses
+# `go test -count=1` as the deterministic no-cache fallback for release checks.
+# Golden tests require a real IDA worker surface, so the default local suites
+# skip `TestMCPToolGoldens` until that external dependency is explicitly in play.
