@@ -36,7 +36,7 @@ Useful make targets: `make build`, `make test` (unit + consistency), `make inspe
 
 **Go server** (`cmd/ida-pilot`) manages sessions, caching, and MCP tool dispatch. **Python workers** (one per open binary) wrap IDA's idalib via Connect RPC. The Go server never touches IDA directly — all analysis goes through `(*client.Analysis).SomeRPC()` calls.
 
-Worker communication uses Unix domain sockets (Linux/macOS) or TCP on localhost (Windows). The Go `Manager` delegates process startup to the direct launcher (`launcher_direct.go`), which spawns Python as a subprocess, waits for its port/socket readiness, and returns a `LaunchResult` (PID, BaseURL, stop/wait funcs) that the manager wraps into Connect RPC clients.
+Worker communication uses Unix domain sockets (Linux/macOS) or TCP on localhost (Windows). The Go `Manager` delegates process startup to the direct launcher (`launcher_direct.go`), which spawns Python as a subprocess, waits for its port/socket readiness, and returns a `LaunchResult` (PID, BaseURL, stop/wait funcs) that the manager wraps into Connect RPC clients. Each worker is bound to the server's lifetime (`launcher_reap_*.go`): on Windows it joins a `KILL_ON_JOB_CLOSE` Job Object, on Linux it gets `Pdeathsig=SIGKILL`, so even a hard server crash (not just graceful shutdown) leaves no orphaned worker holding a database open.
 
 ### Package layout
 
@@ -44,7 +44,7 @@ Worker communication uses Unix domain sockets (Linux/macOS) or TCP on localhost 
 |---------|------|
 | `internal/server/` | MCP tool handlers, caching, tiers, HTTP transport |
 | `internal/session/` | `Registry` (in-memory session map with max-sessions cap) and `Store` (JSON-on-disk persistence for restart recovery) |
-| `internal/worker/` | `Manager` (lifecycle), `Launcher` interface (`launcher.go`), direct subprocess launcher (`launcher_direct.go`), platform helpers (`launcher_wait.go`, `process_alive_*.go`), `Controller` interface to server |
+| `internal/worker/` | `Manager` (lifecycle), `Launcher` interface (`launcher.go`), direct subprocess launcher (`launcher_direct.go`), platform helpers (`launcher_wait.go`, `process_alive_*.go`), worker-reaping (`launcher_reap_*.go` — Windows Job Object / Linux Pdeathsig so workers die with the server), `Controller` interface to server |
 | `python/worker/` | idalib wrapper (`ida_wrapper.py`), Connect RPC server (`connect_server.py`, `server.py`) |
 | `python/tests/` | Python-side pytest suite: `test_ida_wrapper.py` (wrapper unit tests with mock IDA modules), `test_connect_server.py` (RPC routing tests) |
 | `python/tests/mocks/` | Mock IDA modules (`mock_idapro`, `mock_ida_modules`) for testing without a real IDA Pro installation |

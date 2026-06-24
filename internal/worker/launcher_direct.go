@@ -20,7 +20,7 @@ import (
 func newDirectLauncher(pythonScript string, logger *log.Logger) Launcher {
 	return func(_ context.Context, sess *session.Session, binaryPath string) (LaunchResult, error) {
 		workerCtx, cancel := context.WithCancel(context.Background())
-		cmd, ready, err := startPythonWorker(workerCtx, pythonScript, sess, binaryPath)
+		cmd, ready, err := startPythonWorker(workerCtx, pythonScript, sess, binaryPath, logger)
 		if err != nil {
 			cancel()
 			return LaunchResult{}, err
@@ -41,15 +41,19 @@ type readyEndpoint struct {
 	httpClient *http.Client
 }
 
-func startPythonWorker(workerCtx context.Context, script string, sess *session.Session, binaryPath string) (*exec.Cmd, readyEndpoint, error) {
+func startPythonWorker(workerCtx context.Context, script string, sess *session.Session, binaryPath string, logger *log.Logger) (*exec.Cmd, readyEndpoint, error) {
 	cmd, portFile, err := buildPythonCommand(workerCtx, script, sess, binaryPath)
 	if err != nil {
 		return nil, readyEndpoint{}, err
 	}
+	prepareWorkerCmd(cmd) // bind lifetime to the server (pre-start, platform-specific)
 	attachLogs(cmd)
 	if err := cmd.Start(); err != nil {
 		return nil, readyEndpoint{}, fmt.Errorf("failed to start worker: %w", err)
 	}
+	// Bind ASAP after Start (Windows job assignment) to minimize the orphan
+	// window before the worker is tied to the server's lifetime.
+	superviseWorkerProcess(cmd, logger)
 	ready, err := waitForReadyEndpoint(cmd, sess, portFile)
 	if err != nil {
 		_ = stopDirectWorker(func() {}, cmd, log.New(io.Discard, "", 0))

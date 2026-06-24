@@ -7,6 +7,7 @@ require (
 	github.com/google/jsonschema-go v0.3.0
 	github.com/google/uuid v1.6.0
 	github.com/modelcontextprotocol/go-sdk v1.1.0
+	golang.org/x/sys v0.46.0
 	google.golang.org/protobuf v1.36.10
 )
 
