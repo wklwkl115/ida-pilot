@@ -130,7 +130,10 @@ func (s *Server) openBinary(ctx context.Context, req *mcp.CallToolRequest, args 
 	}
 	args.Path = validPath
 	if existing, ok := s.registry.FindByBinaryPath(args.Path); ok {
-		s.recordProgress(existing.ID, "open_binary", "Session reused", 1, 4)
+		// Do NOT overwrite the session's progress here. The existing session
+		// already carries its true stage (opening/analyzing/warming/ready); a
+		// "reused" stamp would clobber an in-progress analysis and make the
+		// session look ready when it isn't.
 		result := map[string]any{
 			"session_id":  existing.ID,
 			"binary_path": existing.BinaryPath,
@@ -211,12 +214,18 @@ func (s *Server) openBinary(ctx context.Context, req *mcp.CallToolRequest, args 
 
 // enrichSessionResult fetches live session info from the worker and adds
 // has_decompiler, auto_state, and auto_running to the result map (best-effort).
+// Bounded by workerStatusTimeout: when open_binary reuses a session whose worker
+// is mid-analysis, the worker's IDA thread holds the GIL and GetSessionInfo can't
+// answer — without the timeout this would hang the open_binary call for the whole
+// analysis. On timeout we just skip the enrichment.
 func (s *Server) enrichSessionResult(ctx context.Context, sessionID string, result map[string]any) {
 	client, err := s.workers.GetClient(sessionID)
 	if err != nil {
 		return
 	}
-	infoResp, err := (*client.SessionCtrl).GetSessionInfo(ctx, connect.NewRequest(&pb.GetSessionInfoRequest{}))
+	infoCtx, cancel := context.WithTimeout(ctx, workerStatusTimeout)
+	defer cancel()
+	infoResp, err := (*client.SessionCtrl).GetSessionInfo(infoCtx, connect.NewRequest(&pb.GetSessionInfoRequest{}))
 	if err != nil || infoResp.Msg == nil {
 		return
 	}
@@ -389,7 +398,6 @@ func (s *Server) beginBackgroundAnalysis(sess *session.Session, client *worker.W
 	sess.AcquireInFlight()
 	go func() {
 		defer sess.ReleaseInFlight()
-		defer sess.EndAnalysis()
 		success, errMsg, duration := s.executeAnalysisWithHeartbeat(sess, client)
 		if success {
 			// Auto-analysis rewrites the function set, xrefs, etc. Invalidate the
@@ -404,6 +412,11 @@ func (s *Server) beginBackgroundAnalysis(sess *session.Session, client *worker.W
 			}
 			s.recordProgress(sess.ID, "failed", msg, 0, 4)
 		}
+		// Clear the guard BEFORE signaling completion (not via defer, which would
+		// run after the send): a get_session_progress poll racing the handler's
+		// return must not still see AnalysisActive()=true once the terminal stage
+		// is set.
+		sess.EndAnalysis()
 		done <- analysisResult{success: success, duration: duration, errMsg: errMsg}
 	}()
 	return done, true
@@ -456,13 +469,17 @@ func (s *Server) listSessions(ctx context.Context, req *mcp.CallToolRequest, arg
 
 	result := make([]map[string]any, 0, len(sessions))
 	for _, sess := range sessions {
+		// Snapshot under the session lock — LastActivity is written concurrently
+		// by ReleaseInFlight (background opens/analysis releasing their leases),
+		// so reading the fields directly here is a data race.
+		meta := sess.Metadata()
 		result = append(result, map[string]any{
-			"session_id":    sess.ID,
-			"binary_path":   sess.BinaryPath,
-			"created_at":    sess.CreatedAt.Unix(),
-			"last_activity": sess.LastActivity.Unix(),
-			"age_seconds":   time.Since(sess.CreatedAt).Seconds(),
-			"idle_seconds":  time.Since(sess.LastActivity).Seconds(),
+			"session_id":    meta.ID,
+			"binary_path":   meta.BinaryPath,
+			"created_at":    meta.CreatedAt.Unix(),
+			"last_activity": meta.LastActivity.Unix(),
+			"age_seconds":   time.Since(meta.CreatedAt).Seconds(),
+			"idle_seconds":  time.Since(meta.LastActivity).Seconds(),
 		})
 	}
 
