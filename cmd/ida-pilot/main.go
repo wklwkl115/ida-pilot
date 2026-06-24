@@ -14,10 +14,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/wklwkl115/ida-pilot/internal/server"
 	"github.com/wklwkl115/ida-pilot/internal/session"
 	"github.com/wklwkl115/ida-pilot/internal/worker"
-	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 var (
@@ -29,6 +29,7 @@ var (
 	timeoutFlag     = flag.Duration("session-timeout", 0, "Session idle timeout (overrides config)")
 	debugFlag       = flag.Bool("debug", false, "Enable verbose debug logging")
 	enablePyEvalFlg = flag.Bool("enable-py-eval", false, "Register the py_eval tool (arbitrary Python execution in the IDA worker — RCE primitive, off by default)")
+	allowedRootsFlg = flag.String("allowed-roots", "", "Restrict agent-supplied paths to these directories (OS-path-list separated; empty = unrestricted)")
 )
 
 func main() {
@@ -67,6 +68,9 @@ func main() {
 	if *enablePyEvalFlg {
 		cfg.EnablePyEval = true
 	}
+	if *allowedRootsFlg != "" {
+		cfg.AllowedRoots = filepath.SplitList(*allowedRootsFlg)
+	}
 
 	// Validate configuration before starting server
 	if err := validateConfig(&cfg); err != nil {
@@ -82,7 +86,7 @@ func main() {
 	}
 
 	srv := server.New(registry, workers, logger, sessionTimeout, cfg.Debug, store)
-	srv.SetSecurity(cfg.Bind, cfg.EnablePyEval)
+	srv.SetSecurity(cfg.Bind, cfg.EnablePyEval, cfg.AllowedRoots)
 
 	srv.RestoreSessions()
 
@@ -112,6 +116,11 @@ func main() {
 	}
 	if cfg.EnablePyEval {
 		logger.Printf("⚠️  SECURITY: py_eval is ENABLED — any client that can reach this port can execute arbitrary Python on the host (RCE primitive).")
+	}
+	if len(cfg.AllowedRoots) > 0 {
+		logger.Printf("[Security] agent file paths restricted to allowed roots: %v", cfg.AllowedRoots)
+	} else if !isLoopbackBind(cfg.Bind) {
+		logger.Printf("⚠️  SECURITY: no --allowed-roots set — clients can open any file the server user can read. Consider restricting it when exposing the port.")
 	}
 
 	sigChan := make(chan os.Signal, 1)

@@ -683,3 +683,49 @@ class TestDeleteIdaSidecars:
 
         wrapper = IDAWrapper(str(binary), "test-session")
         assert wrapper._delete_ida_sidecars() == []
+
+    def test_ignores_glob_metacharacters_in_path(self, tmp_path, setup_mocks):
+        """A binary_path with glob metacharacters must not expand to a wildcard.
+
+        binary_path is agent-influenced. The old glob.glob approach treated base
+        "pro[g]" as a character class matching the single char g, so a decoy
+        "prog.i64" would be matched and wrongly deleted. The literal-name
+        approach only ever touches the exact "pro[g].i64".
+        """
+        IDAWrapper = setup_mocks
+        binary = tmp_path / "pro[g].bin"
+        binary.write_bytes(b"\x90" * 16)
+        literal_sidecar = tmp_path / "pro[g].i64"
+        literal_sidecar.write_bytes(b"db")
+        decoy = tmp_path / "prog.i64"  # glob [g] expansion would hit this
+        decoy.write_bytes(b"keep")
+
+        wrapper = IDAWrapper(str(binary), "test-session")
+        deleted = wrapper._delete_ida_sidecars()
+
+        assert [os.path.basename(p) for p in deleted] == ["pro[g].i64"]
+        assert not literal_sidecar.exists()
+        assert decoy.exists()  # never matched by a wildcard
+
+    def test_skips_symlinked_sidecar(self, tmp_path, setup_mocks):
+        """A symlinked sidecar is left alone so we never delete through a link
+        to an unrelated file."""
+        IDAWrapper = setup_mocks
+        if sys.platform == "win32":
+            pytest.skip("symlink creation requires elevation on Windows")
+        binary = tmp_path / "subject.bin"
+        binary.write_bytes(b"\x90" * 16)
+        outside = tmp_path / "important.dat"
+        outside.write_bytes(b"do-not-touch")
+        link = tmp_path / "subject.i64"
+        try:
+            link.symlink_to(outside)
+        except OSError:
+            pytest.skip("symlink unsupported in this environment")
+
+        wrapper = IDAWrapper(str(binary), "test-session")
+        deleted = wrapper._delete_ida_sidecars()
+
+        assert deleted == []
+        assert link.is_symlink()  # the link itself is left in place
+        assert outside.exists() and outside.read_bytes() == b"do-not-touch"

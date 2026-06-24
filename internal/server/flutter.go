@@ -6,8 +6,8 @@ import (
 	"errors"
 
 	"connectrpc.com/connect"
-	pb "github.com/wklwkl115/ida-pilot/ida/worker/v1"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	pb "github.com/wklwkl115/ida-pilot/ida/worker/v1"
 )
 
 func (s *Server) importFlutter(ctx context.Context, req *mcp.CallToolRequest, args ImportFlutterRequest) (*mcp.CallToolResult, any, error) {
@@ -18,6 +18,11 @@ func (s *Server) importFlutter(ctx context.Context, req *mcp.CallToolRequest, ar
 	if args.MetaJsonPath == "" {
 		return nil, errors.New("meta_json_path is required"), nil
 	}
+	metaPath, perr := s.validatePath("meta_json_path", args.MetaJsonPath)
+	if perr != nil {
+		return nil, s.logAndReturnError("import_flutter path validation", perr), nil
+	}
+	args.MetaJsonPath = metaPath
 
 	_, client, err := s.resolveClientWait(ctx, req, args.SessionID, "import_flutter")
 	if err != nil {

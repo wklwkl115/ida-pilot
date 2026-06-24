@@ -13,10 +13,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	pb "github.com/wklwkl115/ida-pilot/ida/worker/v1"
 	"github.com/wklwkl115/ida-pilot/internal/session"
 	"github.com/wklwkl115/ida-pilot/internal/worker"
-	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 const (
@@ -44,6 +44,11 @@ type Config struct {
 	// access) and is an RCE primitive in the hands of any client that can
 	// reach the HTTP port.
 	EnablePyEval bool `json:"enable_py_eval"`
+	// AllowedRoots, when non-empty, restricts every agent-supplied filesystem
+	// path (open_binary, import_metadata) to descendants of these directories,
+	// after symlink resolution. Empty (the default) means no restriction — the
+	// posture for a single trusted local client. Set it when exposing the port.
+	AllowedRoots []string `json:"allowed_roots"`
 }
 
 // DefaultBind is the loopback address used when no Bind value is configured.
@@ -57,6 +62,7 @@ type Server struct {
 	debug          bool
 	enablePyEval   bool // gates registration of the py_eval tool
 	bind           string
+	allowedRoots   []string // normalized filesystem allowlist; empty = unrestricted
 	store          *session.Store
 	cacheMu        sync.Mutex
 	cache          map[string]*sessionCache
@@ -82,12 +88,15 @@ func New(registry *session.Registry, workers worker.Controller, logger *log.Logg
 	}
 }
 
-// SetSecurity configures the bind address (used by the Origin/Host middleware)
-// and the py_eval enablement flag. Call before RegisterTools so the tier
-// registration sees the final flag value.
-func (s *Server) SetSecurity(bind string, enablePyEval bool) {
+// SetSecurity configures the bind address (used by the Origin/Host middleware),
+// the py_eval enablement flag, and the filesystem path allowlist. Call before
+// RegisterTools so the tier registration sees the final flag value. allowedRoots
+// is normalized (absolute + symlink-resolved) here so the per-request check is a
+// cheap prefix test.
+func (s *Server) SetSecurity(bind string, enablePyEval bool, allowedRoots []string) {
 	s.bind = bind
 	s.enablePyEval = enablePyEval
+	s.allowedRoots = normalizeRoots(allowedRoots)
 }
 
 func GetDefaultDBDir() string {
@@ -174,6 +183,10 @@ func ApplyEnvOverrides(cfg *Config) {
 		if parsed, ok := parseBool(val); ok {
 			cfg.EnablePyEval = parsed
 		}
+	}
+	if val := os.Getenv("IDA_PILOT_ALLOWED_ROOTS"); val != "" {
+		// OS path-list separator (':' on Unix, ';' on Windows), matching $PATH.
+		cfg.AllowedRoots = filepath.SplitList(val)
 	}
 }
 

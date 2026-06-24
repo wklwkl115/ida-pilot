@@ -2,7 +2,7 @@
   "mcpServers": {
     "ida-pilot": {
       "type": "http",
-      "url": "http://127.0.0.1:17300/mcp"
+      "url": "http://127.0.0.1:17300/"
     }
   }
 }

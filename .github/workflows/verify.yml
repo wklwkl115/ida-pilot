@@ -9,6 +9,7 @@ on:
 
 jobs:
   verify:
+    name: verify (windows)
     runs-on: windows-latest
     permissions:
       contents: read
@@ -34,3 +35,45 @@ jobs:
 
       - name: Run verify gate
         run: mise run verify
+
+  # Cross-platform smoke: the Go server and Python worker are platform-agnostic
+  # except for the worker subprocess/socket layer (build-tagged), so the unit and
+  # mock suites must pass on Linux/macOS too. No IDA Pro required. Windows is
+  # already covered by the verify job above.
+  unit:
+    name: unit (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python test deps
+        run: python -m pip install -r python/requirements-test.txt
+
+      - name: Go vet
+        run: go vet ./...
+
+      - name: Go build
+        run: go build ./...
+
+      - name: Go unit + transport tests (no IDA)
+        run: go test ./internal/... ./ida/... -skip TestMCPToolGoldens
+
+      - name: Python mock tests (no IDA)
+        run: python -m pytest python/tests/test_ida_wrapper.py python/tests/test_connect_server.py -v

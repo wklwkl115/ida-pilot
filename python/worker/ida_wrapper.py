@@ -179,19 +179,30 @@ class IDAWrapper:
 
     def _delete_ida_sidecars(self) -> list[str]:
         """Delete IDA's per-binary sidecar files (.i64/.idb/.id0/.id1/.id2/
-        .nam/.til). Returns the list of paths actually removed so the caller
-        can log a useful count."""
-        import glob
+        .nam/.til) sitting next to the binary. Returns the paths actually
+        removed so the caller can log a count.
+
+        Only an exact ``<base>.<ext>`` regular file is removed — never a glob,
+        a directory, or a symlink. binary_path is ultimately agent-influenced,
+        so building literal candidate names (instead of glob.glob, which would
+        treat ``*``/``?``/``[`` in the path as wildcards) prevents a crafted
+        path from widening this into an arbitrary-file delete, and the
+        islink() guard prevents deleting through a symlink to an unrelated file.
+        """
         base_path = os.path.splitext(self.binary_path)[0]
         deleted = []
         for ext in self._IDA_SIDECAR_EXTS:
-            for filepath in glob.glob(f"{base_path}.{ext}"):
-                try:
-                    os.remove(filepath)
-                    deleted.append(filepath)
-                    logging.info(f"Deleted corrupted database file: {filepath}")
-                except Exception as e:
-                    logging.warning(f"Could not delete {filepath}: {e}")
+            filepath = f"{base_path}.{ext}"
+            # isfile() follows symlinks; islink() flags the link itself. Acting
+            # only when isfile and not islink restricts removal to real files.
+            if not os.path.isfile(filepath) or os.path.islink(filepath):
+                continue
+            try:
+                os.remove(filepath)
+                deleted.append(filepath)
+                logging.info(f"Deleted corrupted database file: {filepath}")
+            except OSError as e:
+                logging.warning(f"Could not delete {filepath}: {e}")
         return deleted
 
     def _attach_ida_modules(self) -> None:

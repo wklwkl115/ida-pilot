@@ -8,10 +8,10 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	pb "github.com/wklwkl115/ida-pilot/ida/worker/v1"
 	"github.com/wklwkl115/ida-pilot/internal/session"
 	"github.com/wklwkl115/ida-pilot/internal/worker"
-	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // Session lifecycle management functions
@@ -124,6 +124,11 @@ func (s *Server) cleanupExpiredSessions(expired []*session.Session) int {
 
 func (s *Server) openBinary(ctx context.Context, req *mcp.CallToolRequest, args OpenBinaryRequest) (*mcp.CallToolResult, any, error) {
 	s.logToolInvocation("open_binary", "", map[string]any{"path": args.Path, "skip_analysis": args.SkipAnalysis})
+	validPath, perr := s.validatePath("path", args.Path)
+	if perr != nil {
+		return nil, s.logAndReturnError("open_binary path validation", perr), nil
+	}
+	args.Path = validPath
 	if existing, ok := s.registry.FindByBinaryPath(args.Path); ok {
 		s.recordProgress(existing.ID, "open_binary", "Session reused", 1, 4)
 		result := map[string]any{

@@ -6,5 +6,6 @@
   "database_directory": "./databases",
   "python_worker_path": "python/worker/server.py",
   "debug": false,
-  "enable_py_eval": false
+  "enable_py_eval": false,
+  "allowed_roots": []
 }

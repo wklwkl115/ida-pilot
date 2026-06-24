@@ -11,6 +11,9 @@ IDA Pilot has **no built-in authentication**. The defaults are tuned for a singl
 - **Bound to `127.0.0.1` by default.** Only callers on the local host can reach it. Override with `--bind 0.0.0.0` (or `IDA_PILOT_BIND`) only if you are putting an authenticated reverse proxy in front.
 - **`Origin` / `Host` validation** on every request when bound to loopback — blocks DNS-rebinding and browser cross-origin attacks.
 - **`py_eval` is OFF by default.** It runs arbitrary Python inside the IDA worker (full host filesystem + network access). Enable explicitly with `--enable-py-eval` (or `IDA_PILOT_ENABLE_PY_EVAL=1`) and treat the resulting endpoint as an RCE primitive — anyone who can reach the port can execute code.
+- **Filesystem allowlist (opt-in).** By default a client can open any file the server user can read (`open_binary`, `import_metadata`). Set `--allowed-roots` (or `IDA_PILOT_ALLOWED_ROOTS`) to confine those paths to specific directories — recommended whenever you expose the port. Paths are symlink-resolved before the check, so a link inside a root can't escape it.
+
+The truncated-output cache (`get_cached_output`) is process-global with no per-session ACL — the server has no client identity to bind entries to — so access rests on unguessable 128-bit cache IDs plus the loopback/Origin guards above, not on session ownership.
 
 In short: **a fresh `./bin/ida-pilot` run is safe to leave on; opening the port to the network or enabling `py_eval` is an explicit choice and your responsibility to protect.**
 
@@ -38,7 +41,7 @@ IDA database (.i64)
 
 - **IDA Pro 9.0+** with idalib activated ([docs](https://docs.hex-rays.com/user-guide/idalib))
 - **Go 1.25+**
-- **Python 3.10+**
+- **Python 3.10+** (the supported floor; CI and `mise` pin 3.12)
 
 ### Build
 
@@ -208,6 +211,7 @@ The surface is intentionally small: related operations are consolidated behind a
 --session-timeout   Session idle timeout (e.g. 4h)
 --debug             Verbose logging
 --enable-py-eval    Register the py_eval tool (arbitrary Python in the IDA worker — RCE primitive)
+--allowed-roots     Restrict agent-supplied paths to these dirs (OS-path-list separated; empty = unrestricted)
 ```
 
 ### Environment Variables
@@ -220,6 +224,7 @@ IDA_PILOT_MAX_SESSIONS=10
 IDA_PILOT_WORKER=/path/to/worker.py
 IDA_PILOT_DEBUG=1
 IDA_PILOT_ENABLE_PY_EVAL=0
+IDA_PILOT_ALLOWED_ROOTS=/srv/samples:/data/binaries   # OS-path-list separated; empty = unrestricted
 ```
 
 ### config.json
@@ -233,7 +238,8 @@ IDA_PILOT_ENABLE_PY_EVAL=0
   "database_directory": "./databases",
   "python_worker_path": "python/worker/server.py",
   "debug": false,
-  "enable_py_eval": false
+  "enable_py_eval": false,
+  "allowed_roots": []
 }
 ```
 
@@ -259,6 +265,12 @@ ida-pilot/
 ├── proto/                # Protobuf service definitions
 └── python/worker/        # idalib wrapper + Connect RPC server
 ```
+
+## Contributing
+
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the
+local test gates, and conventions. To report a security issue privately, see
+[SECURITY.md](SECURITY.md).
 
 ## License
 

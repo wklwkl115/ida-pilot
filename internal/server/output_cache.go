@@ -98,8 +98,15 @@ func (c *outputStore) clear() int {
 	return n
 }
 
+// genCacheID returns a 128-bit cryptographically-random hex token. The output
+// store is process-global and has no per-session ACL — by design, since the
+// server has no client authentication to bind an entry to (any client could
+// assert any session_id). Unguessable IDs are therefore the access boundary: 128
+// bits makes enumeration or guessing infeasible, so a cache_id only reaches a
+// caller that already received it from its own truncated response. The loopback
+// bind and Origin/Host guard keep that channel local in the default posture.
 func genCacheID() string {
-	b := make([]byte, 8)
+	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
 		return fmt.Sprintf("%016x%016x", uint64(time.Now().UnixNano()), cacheIDFallbackCounter.Add(1))
 	}

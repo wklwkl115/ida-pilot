@@ -6,8 +6,8 @@ import (
 	"errors"
 
 	"connectrpc.com/connect"
-	pb "github.com/wklwkl115/ida-pilot/ida/worker/v1"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	pb "github.com/wklwkl115/ida-pilot/ida/worker/v1"
 )
 
 func (s *Server) importIl2cpp(ctx context.Context, req *mcp.CallToolRequest, args ImportIl2cppRequest) (*mcp.CallToolResult, any, error) {
@@ -21,6 +21,15 @@ func (s *Server) importIl2cpp(ctx context.Context, req *mcp.CallToolRequest, arg
 	if args.Il2cppPath == "" {
 		return nil, errors.New("il2cpp_path is required"), nil
 	}
+	scriptPath, perr := s.validatePath("script_path", args.ScriptPath)
+	if perr != nil {
+		return nil, s.logAndReturnError("import_il2cpp path validation", perr), nil
+	}
+	il2cppPath, perr := s.validatePath("il2cpp_path", args.Il2cppPath)
+	if perr != nil {
+		return nil, s.logAndReturnError("import_il2cpp path validation", perr), nil
+	}
+	args.ScriptPath, args.Il2cppPath = scriptPath, il2cppPath
 
 	_, client, err := s.resolveClientWait(ctx, req, args.SessionID, "import_il2cpp")
 	if err != nil {
