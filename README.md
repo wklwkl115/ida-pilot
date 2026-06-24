@@ -1,8 +1,26 @@
 # IDA Pilot
 
+[![verify](https://github.com/wklwkl115/ida-pilot/actions/workflows/verify.yml/badge.svg)](https://github.com/wklwkl115/ida-pilot/actions/workflows/verify.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
+![Go](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
+![MCP](https://img.shields.io/badge/MCP-server-7c3aed)
+![Platforms](https://img.shields.io/badge/platform-windows%20%7C%20linux%20%7C%20macos-lightgrey)
+
+> Drive IDA Pro's decompiler and disassembler from an AI agent over the Model Context Protocol — headless, fast, and token-frugal.
+
 Headless IDA Pro analysis server exposing MCP tools (28 with `py_eval` enabled, 27 without). Designed for AI agents — tiered tool loading, multi-layer caching, batch operations, and compact payloads minimize token cost per turn.
 
 Go orchestrates sessions and caching. Python workers run IDA via idalib. Communication uses Connect RPC over TCP.
+
+## Why IDA Pilot?
+
+- **Built for agents, not humans.** Every response is compact — hex addresses, sparse fields, `[address, type]` xref tuples, `"ok"` instead of `{"success": true}` — to spend the fewest tokens per turn.
+- **One call, not ten.** Composite tools like `survey_binary` and `analyze_function` return decompilation + metadata + xrefs + comments in a single round-trip; `analyze_functions` batches up to 10 at once.
+- **Stays responsive on huge binaries.** Loading and auto-analysis run detached with a live progress heartbeat, so a 200 MB binary won't stall or time out your MCP client — you poll until `ready=true` and keep working.
+- **Tiered tool surface.** Agents boot with 3 tools; read/analysis and write tools promote in as the workflow advances, keeping the per-turn schema small.
+- **Multi-binary.** Open several databases and `cross_reference` / `cross_search` across them.
+- **Safe by default.** Loopback-only bind, `py_eval` off, `Origin`/`Host` guard, optional path allowlist (details below).
 
 ## ⚠️ Security model — read before exposing the port
 
