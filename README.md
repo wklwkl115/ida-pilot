@@ -9,6 +9,8 @@
 
 > Drive IDA Pro's decompiler and disassembler from an AI agent over the Model Context Protocol — headless, fast, and token-frugal.
 
+![IDA Pilot — an MCP session: open a binary, watch auto-analysis progress without blocking, survey in one call, then decompile a function](docs/demo.gif)
+
 Headless IDA Pro analysis server exposing MCP tools (28 with `py_eval` enabled, 27 without). Designed for AI agents — tiered tool loading, multi-layer caching, batch operations, and compact payloads minimize token cost per turn.
 
 Go orchestrates sessions and caching. Python workers run IDA via idalib. Communication uses Connect RPC over TCP.
