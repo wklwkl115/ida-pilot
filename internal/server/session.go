@@ -57,7 +57,26 @@ func (s *Server) RestoreSessions() {
 			s.deleteSessionCache(sess.ID)
 			continue
 		}
-		s.logger.Printf("Session %s restored for binary %s", sess.ID, meta.BinaryPath)
+		client, err := s.workers.GetClient(sess.ID)
+		if err != nil {
+			s.logger.Printf("Failed to get worker client for restored session %s: %v", sess.ID, err)
+			s.workers.Stop(sess.ID)
+			s.registry.Delete(sess.ID)
+			s.deleteSessionState(sess.ID)
+			s.deleteSessionCache(sess.ID)
+			continue
+		}
+		// workers.Start only spawns the worker process; the worker opens its IDA
+		// database lazily on OpenBinary. Without re-opening here, a restored
+		// session has a live worker with a CLOSED database, and the first analysis
+		// tool fails with "database not open". Re-open in the background (detached,
+		// like a fresh open) so the existing .i64 — saved on graceful shutdown — is
+		// reloaded with its prior analysis; auto-analysis re-runs cheaply (the
+		// queue is empty) if the database turns out complete, or finishes the job
+		// if a crash left it partial.
+		s.recordProgress(sess.ID, "opening", "Reloading binary into IDA", 1, 4)
+		go s.backgroundOpen(sess, client, meta.BinaryPath, true, nil, context.Background())
+		s.logger.Printf("Session %s restored for binary %s — reopening database in background", sess.ID, meta.BinaryPath)
 	}
 }
 

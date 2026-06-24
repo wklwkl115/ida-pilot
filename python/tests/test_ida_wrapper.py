@@ -684,6 +684,24 @@ class TestDeleteIdaSidecars:
         wrapper = IDAWrapper(str(binary), "test-session")
         assert wrapper._delete_ida_sidecars() == []
 
+    def test_removes_appended_naming_scheme(self, tmp_path, setup_mocks):
+        """idalib names unpacked DB files by APPENDING (subject.bin.id0), not by
+        replacing the extension (subject.id0). The repair path must find both."""
+        IDAWrapper = setup_mocks
+        binary = tmp_path / "subject.bin"
+        binary.write_bytes(b"\x90" * 16)
+        appended = [tmp_path / f"subject.bin.{ext}" for ext in ("id0", "id1", "nam")]
+        for f in appended:
+            f.write_bytes(b"stale")
+
+        wrapper = IDAWrapper(str(binary), "test-session")
+        deleted = wrapper._delete_ida_sidecars()
+
+        assert {os.path.basename(p) for p in deleted} == {f.name for f in appended}
+        for f in appended:
+            assert not f.exists()
+        assert binary.exists()  # the binary itself is never a sidecar
+
     def test_ignores_glob_metacharacters_in_path(self, tmp_path, setup_mocks):
         """A binary_path with glob metacharacters must not expand to a wildcard.
 

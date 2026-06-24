@@ -189,20 +189,27 @@ class IDAWrapper:
         path from widening this into an arbitrary-file delete, and the
         islink() guard prevents deleting through a symlink to an unrelated file.
         """
-        base_path = os.path.splitext(self.binary_path)[0]
+        # IDA derives the database name two ways depending on version/mode:
+        # extension REPLACED ("foo.exe" -> "foo.i64") or APPENDED ("foo.exe" ->
+        # "foo.exe.id0", which is what idalib produces for the unpacked working
+        # files). Cover both bases so the repair path actually finds the
+        # components to purge instead of silently missing them.
+        bases = {os.path.splitext(self.binary_path)[0], self.binary_path}
         deleted = []
-        for ext in self._IDA_SIDECAR_EXTS:
-            filepath = f"{base_path}.{ext}"
-            # isfile() follows symlinks; islink() flags the link itself. Acting
-            # only when isfile and not islink restricts removal to real files.
-            if not os.path.isfile(filepath) or os.path.islink(filepath):
-                continue
-            try:
-                os.remove(filepath)
-                deleted.append(filepath)
-                logging.info(f"Deleted corrupted database file: {filepath}")
-            except OSError as e:
-                logging.warning(f"Could not delete {filepath}: {e}")
+        for base in bases:
+            for ext in self._IDA_SIDECAR_EXTS:
+                filepath = f"{base}.{ext}"
+                # isfile() follows symlinks; islink() flags the link itself.
+                # Acting only when isfile and not islink restricts removal to
+                # real files.
+                if not os.path.isfile(filepath) or os.path.islink(filepath):
+                    continue
+                try:
+                    os.remove(filepath)
+                    deleted.append(filepath)
+                    logging.info(f"Deleted corrupted database file: {filepath}")
+                except OSError as e:
+                    logging.warning(f"Could not delete {filepath}: {e}")
         return deleted
 
     def _attach_ida_modules(self) -> None:

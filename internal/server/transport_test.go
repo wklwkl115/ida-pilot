@@ -238,6 +238,62 @@ func TestOpenBinaryReusesActiveSession(t *testing.T) {
 	}
 }
 
+// TestRestoreSessionsReopensBinary guards the restore path: spawning the worker
+// is not enough — the worker opens its database lazily, so restore must also
+// re-issue OpenBinary or the session comes back with a closed database and the
+// first analysis tool fails with "database not open".
+func TestRestoreSessionsReopensBinary(t *testing.T) {
+	dir := t.TempDir()
+	store, err := session.NewStore(filepath.Join(dir, "sessions"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	binaryPath := filepath.Join(dir, "restored.bin")
+	if err := os.WriteFile(binaryPath, []byte("x"), 0o644); err != nil {
+		t.Fatalf("write binary: %v", err)
+	}
+	// Persist a session as if a prior server run had it open.
+	if err := store.Save(&session.Session{
+		ID:           "rest1234",
+		BinaryPath:   binaryPath,
+		CreatedAt:    time.Now(),
+		LastActivity: time.Now(),
+		Timeout:      time.Minute,
+	}); err != nil {
+		t.Fatalf("persist session: %v", err)
+	}
+
+	registry := session.NewRegistry(4)
+	workers := newFakeWorkerManager(t)
+	srv := New(registry, workers, log.New(io.Discard, "", 0), time.Minute, false, store)
+
+	srv.RestoreSessions()
+
+	if _, ok := registry.Get("rest1234"); !ok {
+		t.Fatal("session was not restored into the registry")
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !workers.Opened("rest1234") {
+		if time.Now().After(deadline) {
+			t.Fatal("restored worker was never re-opened (OpenBinary not issued)")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// The background re-open should drive the session to ready on its own.
+	for {
+		p, ok := srv.getProgress("rest1234")
+		if ok && p.Stage == "ready" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("restored session never reached ready (progress=%+v)", p)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestBackgroundOpenTracksInFlightUntilReady(t *testing.T) {
 	logger := log.New(io.Discard, "", 0)
 	registry := session.NewRegistry(4)
@@ -1586,6 +1642,7 @@ type fakeWorker struct {
 	binaryPath string
 	closed     bool
 	analyzed   bool
+	opened     bool
 
 	planAndWaitStarted  chan struct{}
 	planAndWaitBlock    chan struct{}
@@ -1676,6 +1733,20 @@ func (f *fakeWorkerManager) StartCount(binaryPath string) int {
 	return f.starts[binaryPath]
 }
 
+// Opened reports whether OpenBinary was called on the session's worker (i.e. the
+// IDA database was actually loaded, not just the process spawned).
+func (f *fakeWorkerManager) Opened(sessionID string) bool {
+	f.mu.Lock()
+	fake, ok := f.sessions[sessionID]
+	f.mu.Unlock()
+	if !ok {
+		return false
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	return fake.opened
+}
+
 type fakeSessionControlServer struct {
 	worker *fakeWorker
 }
@@ -1684,6 +1755,7 @@ func (f *fakeSessionControlServer) OpenBinary(_ context.Context, req *connect.Re
 	f.worker.mu.Lock()
 	f.worker.binaryPath = req.Msg.GetBinaryPath()
 	f.worker.closed = false
+	f.worker.opened = true
 	f.worker.mu.Unlock()
 	return connect.NewResponse(&pb.OpenBinaryResponse{
 		Success:       true,
