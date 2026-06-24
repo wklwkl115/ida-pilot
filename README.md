@@ -191,6 +191,8 @@ The surface is intentionally small: related operations are consolidated behind a
 | `get_disasm` | Disassembly at an address, or the whole function |
 | `read_memory` | Raw memory: `format`=bytes/dword/qword/byte/string |
 
+![Navigating a binary — query imports by module, filter functions by regex, list xrefs to an address](docs/explore.gif)
+
 ### Cross-session (Tier 1)
 
 | Tool | Description |
@@ -217,6 +219,8 @@ The surface is intentionally small: related operations are consolidated behind a
 | `set_type` | `target`=function (prototype), global (C type), or lvar (C type + `function_address` + `lvar_name`) |
 | `make_function` | Create a function at an address |
 | `import_metadata` | `format`=il2cpp (script.json + il2cpp.h) or flutter (flutter_meta.json) |
+
+![Annotating a function — one annotate_function call renames locals (a1→ctx, a2→count) and adds a comment, then returns the updated pseudocode](docs/annotate.gif)
 
 ## Configuration
 
