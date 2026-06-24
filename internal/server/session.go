@@ -235,11 +235,16 @@ func (s *Server) backgroundOpen(sess *session.Session, client *worker.WorkerClie
 	sess.AcquireInFlight()
 	defer sess.ReleaseInFlight()
 
-	s.emitProgress(progress, sess.ID, "opening", "Loading binary into IDA", 1, 4)
-	resp, err := (*client.SessionCtrl).OpenBinary(bgCtx, connect.NewRequest(&pb.OpenBinaryRequest{
-		BinaryPath:  path,
-		AutoAnalyze: false,
-	}))
+	// Loading a large binary is itself a long GIL-holding worker call, so drive
+	// it under a heartbeat too (not just analysis).
+	var resp *connect.Response[pb.OpenBinaryResponse]
+	var err error
+	s.withHeartbeat(sess.ID, "opening", "Loading binary into IDA", 1, 4, func() {
+		resp, err = (*client.SessionCtrl).OpenBinary(bgCtx, connect.NewRequest(&pb.OpenBinaryRequest{
+			BinaryPath:  path,
+			AutoAnalyze: false,
+		}))
+	})
 	if err != nil {
 		s.recordProgress(sess.ID, "failed", fmt.Sprintf("Failed to open binary: %v", err), 0, 4)
 		s.logger.Printf("[open_binary] session=%s open failed: %v", sess.ID, err)
@@ -282,11 +287,19 @@ func (s *Server) backgroundOpen(sess *session.Session, client *worker.WorkerClie
 }
 
 // analysisHeartbeatInterval is how often a heartbeat refreshes the progress
-// snapshot while plan_and_wait blocks the worker's single IDA thread. IDA's
-// auto_wait() is one opaque blocking call with no sub-progress, so the heartbeat
-// reports elapsed time — enough for get_session_progress to show liveness (fresh
-// last_updated_ago) and for a streaming client to keep its timeout alive.
+// snapshot while a long worker call (open_database, auto_wait) holds the Python
+// GIL on the worker's single IDA thread. Those calls are opaque blocking C calls
+// with no sub-progress and — critically — they starve the worker's "lightweight"
+// status endpoint (it can't run Python to answer while the GIL is held). The
+// heartbeat is the server-side liveness signal that survives that: it refreshes
+// last_updated_ago so get_session_progress shows movement, and keeps a streaming
+// client's timeout alive, even though the worker itself is momentarily mute.
 const analysisHeartbeatInterval = 5 * time.Second
+
+// workerStatusTimeout bounds the best-effort GetSessionInfo call in
+// get_session_progress so a momentarily GIL-bound worker can never stall the
+// poll. On timeout we fall back to the Go-side progress snapshot.
+const workerStatusTimeout = 3 * time.Second
 
 // analysisResult is the outcome of a background auto-analysis pass.
 type analysisResult struct {
@@ -295,15 +308,16 @@ type analysisResult struct {
 	errMsg   string
 }
 
-// executeAnalysisWithHeartbeat runs plan_and_wait on a DETACHED context while a
-// heartbeat goroutine refreshes the "analyzing" progress snapshot. It blocks
-// until analysis finishes and returns (success, errMsg, durationSeconds). It
-// deliberately uses context.Background() rather than any request context: a
-// client tool-call timeout must never abort an analysis the worker can't
-// interrupt anyway. The caller owns cache invalidation and the terminal stage.
-func (s *Server) executeAnalysisWithHeartbeat(sess *session.Session, client *worker.WorkerClient) (bool, string, float64) {
+// withHeartbeat runs fn while a heartbeat keeps the given progress stage fresh
+// (elapsed time + updated timestamp) every analysisHeartbeatInterval. Use it
+// around long worker RPCs (load / analysis) so pollers see liveness even while
+// the worker's IDA thread holds the GIL. The progress fraction stays fixed; the
+// message carries elapsed time. It waits for the heartbeat goroutine to exit
+// before returning, so no stale write lands after the caller records the next
+// stage.
+func (s *Server) withHeartbeat(sessionID, stage, message string, prog, total float64, fn func()) {
 	start := time.Now()
-	s.recordProgress(sess.ID, "analyzing", "Running auto-analysis", 2, 4)
+	s.recordProgress(sessionID, stage, message, prog, total)
 
 	stop := make(chan struct{})
 	hbDone := make(chan struct{})
@@ -317,18 +331,30 @@ func (s *Server) executeAnalysisWithHeartbeat(sess *session.Session, client *wor
 				return
 			case <-ticker.C:
 				elapsed := time.Since(start).Round(time.Second)
-				s.recordProgress(sess.ID, "analyzing",
-					fmt.Sprintf("Auto-analysis running (%s elapsed)", elapsed), 2, 4)
+				s.recordProgress(sessionID, stage,
+					fmt.Sprintf("%s (%s elapsed)", message, elapsed), prog, total)
 			}
 		}
 	}()
 
-	resp, err := (*client.SessionCtrl).PlanAndWait(context.Background(), connect.NewRequest(&pb.PlanAndWaitRequest{}))
+	fn()
 
-	// Stop the heartbeat and wait for it to exit before returning, so no stale
-	// "analyzing" write can land after the caller records the terminal stage.
 	close(stop)
 	<-hbDone
+}
+
+// executeAnalysisWithHeartbeat runs plan_and_wait on a DETACHED context under a
+// heartbeat. It blocks until analysis finishes and returns (success, errMsg,
+// durationSeconds). It deliberately uses context.Background() rather than any
+// request context: a client tool-call timeout must never abort an analysis the
+// worker can't interrupt anyway. The caller owns cache invalidation and the
+// terminal stage.
+func (s *Server) executeAnalysisWithHeartbeat(sess *session.Session, client *worker.WorkerClient) (bool, string, float64) {
+	var resp *connect.Response[pb.PlanAndWaitResponse]
+	var err error
+	s.withHeartbeat(sess.ID, "analyzing", "Running auto-analysis", 2, 4, func() {
+		resp, err = (*client.SessionCtrl).PlanAndWait(context.Background(), connect.NewRequest(&pb.PlanAndWaitRequest{}))
+	})
 
 	if err != nil {
 		return false, fmt.Sprintf("auto-analysis failed: %v", err), 0
@@ -390,9 +416,11 @@ func (s *Server) closeBinary(ctx context.Context, req *mcp.CallToolRequest, args
 		return nil, err, nil
 	}
 
-	if err := s.workers.Stop(sess.ID); err != nil {
-		return nil, s.logAndReturnError("close_binary worker stop", err), nil
-	}
+	// Tear down the session record unconditionally. A worker-stop failure must
+	// not leave the session persisted in the store, or RestoreSessions would try
+	// to respawn a worker for it on the next start. Surface the stop error as a
+	// warning instead of aborting the cleanup.
+	stopErr := s.workers.Stop(sess.ID)
 
 	s.registry.Delete(sess.ID)
 	s.deleteSessionState(sess.ID)
@@ -401,6 +429,19 @@ func (s *Server) closeBinary(ctx context.Context, req *mcp.CallToolRequest, args
 
 	if len(s.registry.List()) == 0 {
 		s.demoteToTier0()
+	}
+
+	if stopErr != nil {
+		s.logger.Printf("[close_binary] session=%s worker stop reported %v; session record removed anyway", sess.ID, stopErr)
+		body, _ := json.Marshal(map[string]any{
+			"status":  "closed",
+			"warning": fmt.Sprintf("worker stop: %v", stopErr),
+		})
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{Text: string(body)},
+			},
+		}, nil, nil
 	}
 
 	return &mcp.CallToolResult{
@@ -486,12 +527,30 @@ func (s *Server) getSessionProgress(ctx context.Context, req *mcp.CallToolReques
 		percent = (progressValue / totalValue) * 100.0
 	}
 
-	var autoState = "unknown"
-	var autoRunning bool
-	if client, err := s.workers.GetClient(sess.ID); err == nil {
-		if infoResp, err := (*client.SessionCtrl).GetSessionInfo(ctx, connect.NewRequest(&pb.GetSessionInfoRequest{})); err == nil {
-			autoState = infoResp.Msg.GetAutoState()
-			autoRunning = infoResp.Msg.GetAutoRunning()
+	// Readiness is decided from Go-side signals — the progress stage (kept fresh
+	// by the heartbeat) and the analysis guard — NOT a synchronous worker
+	// round-trip. During a long load/analysis the worker's IDA thread holds the
+	// Python GIL through an opaque C call (open_database / auto_wait), which
+	// starves its own "lightweight" GetSessionInfo endpoint; querying it then
+	// would block this poll for the entire phase (observed: a single poll hung
+	// 64s mid-analysis). So we only consult the worker — briefly, best-effort —
+	// when nothing IDA-bound is in flight, purely to enrich auto_state.
+	analysisRunning := sess.AnalysisActive()
+	autoState := "unknown"
+	autoRunning := analysisRunning
+	switch {
+	case analysisRunning:
+		autoState = "analyzing"
+	case inProgressStages[stage]:
+		autoState = stage
+	default:
+		if client, err := s.workers.GetClient(sess.ID); err == nil {
+			infoCtx, cancel := context.WithTimeout(ctx, workerStatusTimeout)
+			if infoResp, err := (*client.SessionCtrl).GetSessionInfo(infoCtx, connect.NewRequest(&pb.GetSessionInfoRequest{})); err == nil {
+				autoState = infoResp.Msg.GetAutoState()
+				autoRunning = infoResp.Msg.GetAutoRunning()
+			}
+			cancel()
 		}
 	}
 
@@ -505,11 +564,11 @@ func (s *Server) getSessionProgress(ctx context.Context, req *mcp.CallToolReques
 	now := time.Now().UTC()
 
 	// Keep readiness consistent with the resolveClient gate (readinessError):
-	// a session is ready exactly when analysis tools would be accepted — i.e.
-	// not in a load/analysis stage, not failed, and auto-analysis not running.
-	// This covers reused sessions (stage "open_binary") and restored sessions
-	// (no snapshot → stage "idle"), which the gate already admits.
-	ready := !autoRunning && stage != "failed" && !inProgressStages[stage]
+	// ready exactly when analysis tools would be accepted — not in a load/analysis
+	// stage, not failed, and no analysis pass in flight. analysisRunning (the
+	// Go-side guard) is authoritative; autoRunning only carries the best-effort
+	// worker value for the idle/restored case where we actually queried it.
+	ready := !analysisRunning && !autoRunning && stage != "failed" && !inProgressStages[stage]
 	var nextStep string
 	switch {
 	case ready:

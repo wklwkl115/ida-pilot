@@ -438,6 +438,55 @@ func TestRunAutoAnalysisRejectsConcurrentPass(t *testing.T) {
 	close(workers.planAndWaitBlock)
 }
 
+// TestGetSessionProgressDoesNotBlockDuringAnalysis is the regression guard for
+// the GIL-starvation finding: while a long IDA call holds the worker's GIL its
+// GetSessionInfo endpoint can't answer, so get_session_progress must NOT make a
+// synchronous worker call during analysis — it must report from the Go-side
+// progress snapshot and the analysis guard, and return promptly.
+func TestGetSessionProgressDoesNotBlockDuringAnalysis(t *testing.T) {
+	logger := log.New(io.Discard, "", 0)
+	registry := session.NewRegistry(4)
+	workers := newFakeWorkerManager(t)
+	workers.getSessionInfoBlock = make(chan struct{}) // never closed → GetSessionInfo would hang
+	srv := &Server{registry: registry, workers: workers, logger: logger, sessionTimeout: time.Minute}
+
+	binaryPath := filepath.Join(t.TempDir(), "analyzing.bin")
+	sess, err := registry.Create(binaryPath, time.Minute)
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := workers.Start(context.Background(), sess, binaryPath); err != nil {
+		t.Fatalf("start worker: %v", err)
+	}
+
+	// Simulate analysis in flight: guard claimed + "analyzing" stage.
+	if !sess.TryBeginAnalysis() {
+		t.Fatal("could not claim analysis")
+	}
+	srv.recordProgress(sess.ID, "analyzing", "Running auto-analysis", 2, 4)
+
+	start := time.Now()
+	res, meta, err := srv.getSessionProgress(context.Background(), nil, GetSessionProgressRequest{SessionID: sess.ID})
+	dur := time.Since(start)
+	if err != nil {
+		t.Fatalf("get_session_progress error: %v", err)
+	}
+	if e, ok := meta.(error); ok {
+		t.Fatalf("get_session_progress user error: %v", e)
+	}
+	if dur > time.Second {
+		t.Fatalf("get_session_progress blocked %s during analysis — must skip the GIL-bound worker", dur)
+	}
+	payload := decodeContent(t, res)
+	if ready, _ := payload["ready"].(bool); ready {
+		t.Fatalf("expected ready=false during analysis, got %v", payload)
+	}
+	if st, _ := payload["auto_state"].(string); st != "analyzing" {
+		t.Fatalf("expected auto_state=analyzing (derived, not from worker), got %v", payload)
+	}
+	sess.EndAnalysis()
+}
+
 func TestCleanupExpiredSessionsRechecksAfterInFlightRelease(t *testing.T) {
 	logger := log.New(io.Discard, "", 0)
 	registry := session.NewRegistry(4)
@@ -1514,6 +1563,10 @@ type fakeWorkerManager struct {
 
 	planAndWaitStarted chan struct{}
 	planAndWaitBlock   chan struct{}
+	// getSessionInfoBlock, when non-nil, makes the fake GetSessionInfo hang on
+	// it — simulating a worker whose status endpoint is GIL-starved during a
+	// long IDA call.
+	getSessionInfoBlock chan struct{}
 }
 
 func newFakeWorkerManager(t *testing.T) *fakeWorkerManager {
@@ -1534,21 +1587,24 @@ type fakeWorker struct {
 	closed     bool
 	analyzed   bool
 
-	planAndWaitStarted chan struct{}
-	planAndWaitBlock   chan struct{}
+	planAndWaitStarted  chan struct{}
+	planAndWaitBlock    chan struct{}
+	getSessionInfoBlock chan struct{}
 }
 
 func (f *fakeWorkerManager) Start(_ context.Context, sess *session.Session, binaryPath string) error {
 	f.mu.Lock()
 	planAndWaitStarted := f.planAndWaitStarted
 	planAndWaitBlock := f.planAndWaitBlock
+	getSessionInfoBlock := f.getSessionInfoBlock
 	f.mu.Unlock()
 
 	fake := &fakeWorker{
-		sessionID:          sess.ID,
-		binaryPath:         binaryPath,
-		planAndWaitStarted: planAndWaitStarted,
-		planAndWaitBlock:   planAndWaitBlock,
+		sessionID:           sess.ID,
+		binaryPath:          binaryPath,
+		planAndWaitStarted:  planAndWaitStarted,
+		planAndWaitBlock:    planAndWaitBlock,
+		getSessionInfoBlock: getSessionInfoBlock,
 	}
 
 	sessionSvc := &fakeSessionControlServer{worker: fake}
@@ -1674,7 +1730,15 @@ func (f *fakeSessionControlServer) SaveDatabase(_ context.Context, _ *connect.Re
 	}), nil
 }
 
-func (f *fakeSessionControlServer) GetSessionInfo(_ context.Context, _ *connect.Request[pb.GetSessionInfoRequest]) (*connect.Response[pb.GetSessionInfoResponse], error) {
+func (f *fakeSessionControlServer) GetSessionInfo(ctx context.Context, _ *connect.Request[pb.GetSessionInfoRequest]) (*connect.Response[pb.GetSessionInfoResponse], error) {
+	if f.worker.getSessionInfoBlock != nil {
+		// Simulate a GIL-starved status endpoint: hang until released or ctx done.
+		select {
+		case <-f.worker.getSessionInfoBlock:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	f.worker.mu.Lock()
 	defer f.worker.mu.Unlock()
 	return connect.NewResponse(&pb.GetSessionInfoResponse{

@@ -110,15 +110,23 @@ func waitForTCPReady(cmd *exec.Cmd, portFile string) (readyEndpoint, error) {
 }
 
 func stopDirectWorker(cancel context.CancelFunc, cmd *exec.Cmd, logger *log.Logger) error {
+	// Kill explicitly FIRST, then cancel the context. The reverse order races:
+	// cancel() makes exec's own watcher call Process.Kill() asynchronously, and a
+	// second Kill() landing on an already-terminating process returns
+	// ERROR_ACCESS_DENIED on Windows (not os.ErrProcessDone), surfacing a
+	// spurious "TerminateProcess: Access is denied" from close_binary even though
+	// the worker did die. Killing a live process first avoids that; the
+	// subsequent cancel() only releases context resources (its redundant kill
+	// hits an already-dead process, which exec ignores).
+	var killErr error
+	if cmd.Process != nil {
+		if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			killErr = err
+			logger.Printf("[Worker] Failed to kill PID %d: %v", cmd.Process.Pid, err)
+		}
+	}
 	cancel()
-	if cmd.Process == nil {
-		return nil
-	}
-	if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-		logger.Printf("[Worker] Failed to kill PID %d: %v", cmd.Process.Pid, err)
-		return err
-	}
-	return nil
+	return killErr
 }
 
 func tcpHTTPClient() *http.Client {
