@@ -19,11 +19,11 @@ import (
 
 	"connectrpc.com/connect"
 	"github.com/google/jsonschema-go/jsonschema"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	pb "github.com/wklwkl115/ida-pilot/ida/worker/v1"
 	"github.com/wklwkl115/ida-pilot/ida/worker/v1/workerconnect"
 	"github.com/wklwkl115/ida-pilot/internal/session"
 	"github.com/wklwkl115/ida-pilot/internal/worker"
-	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // TestApplyEnumConstraints verifies discriminator fields get JSON-Schema enum
@@ -293,6 +293,149 @@ func TestBackgroundOpenTracksInFlightUntilReady(t *testing.T) {
 	if sess.IsExpired() {
 		t.Fatal("backgroundOpen release should refresh idle time")
 	}
+}
+
+// TestRunAutoAnalysisDetachesFromRequestContext is the regression guard for the
+// "tool times out but analysis never stops" bug on large binaries: a client
+// tool-call timeout cancels the request ctx, but auto-analysis must keep running
+// to completion on a detached context and the call must return a graceful
+// "still running" result (not an error).
+func TestRunAutoAnalysisDetachesFromRequestContext(t *testing.T) {
+	logger := log.New(io.Discard, "", 0)
+	registry := session.NewRegistry(4)
+	workers := newFakeWorkerManager(t)
+	workers.planAndWaitStarted = make(chan struct{}, 1)
+	workers.planAndWaitBlock = make(chan struct{})
+	srv := &Server{
+		registry:       registry,
+		workers:        workers,
+		logger:         logger,
+		sessionTimeout: time.Minute,
+	}
+
+	binaryPath := filepath.Join(t.TempDir(), "big.bin")
+	sess, err := registry.Create(binaryPath, time.Minute)
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := workers.Start(context.Background(), sess, binaryPath); err != nil {
+		t.Fatalf("start worker: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	type handlerResult struct {
+		result *mcp.CallToolResult
+		meta   any
+		err    error
+	}
+	resCh := make(chan handlerResult, 1)
+	go func() {
+		r, m, e := srv.runAutoAnalysis(ctx, nil, RunAutoAnalysisRequest{SessionID: sess.ID})
+		resCh <- handlerResult{r, m, e}
+	}()
+
+	select {
+	case <-workers.planAndWaitStarted:
+	case <-time.After(time.Second):
+		t.Fatal("auto-analysis did not start")
+	}
+	if !sess.AnalysisActive() {
+		t.Fatal("analysis guard should be held while running")
+	}
+
+	// Simulate the MCP client's per-call timeout firing mid-analysis.
+	cancel()
+
+	var got handlerResult
+	select {
+	case got = <-resCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runAutoAnalysis did not return promptly after ctx cancel")
+	}
+	if got.err != nil {
+		t.Fatalf("expected a graceful result, got error: %v", got.err)
+	}
+	if e, ok := got.meta.(error); ok {
+		t.Fatalf("expected no user error, got: %v", e)
+	}
+	payload := decodeContent(t, got.result)
+	if running, _ := payload["running"].(bool); !running {
+		t.Fatalf("expected running=true after ctx cancel, got %v", payload)
+	}
+	if status, _ := payload["status"].(string); status != "analyzing" {
+		t.Fatalf("expected status=analyzing, got %v", payload)
+	}
+
+	// The analysis must still be in flight (worker not yet unblocked).
+	if !sess.AnalysisActive() {
+		t.Fatal("analysis must continue running after the request returns")
+	}
+	if !sess.HasInFlight() {
+		t.Fatal("detached analysis must hold an in-flight lease past the request")
+	}
+
+	// Let analysis finish; the session must converge to ready on its own.
+	close(workers.planAndWaitBlock)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		p, ok := srv.getProgress(sess.ID)
+		if ok && p.Stage == "ready" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("session did not reach ready after detached analysis (progress=%+v)", p)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if sess.AnalysisActive() {
+		t.Fatal("analysis guard should be released after completion")
+	}
+}
+
+// TestRunAutoAnalysisRejectsConcurrentPass confirms a second run_auto_analysis
+// while one is already in flight returns "already running" instead of launching
+// a duplicate plan_and_wait pass.
+func TestRunAutoAnalysisRejectsConcurrentPass(t *testing.T) {
+	logger := log.New(io.Discard, "", 0)
+	registry := session.NewRegistry(4)
+	workers := newFakeWorkerManager(t)
+	workers.planAndWaitStarted = make(chan struct{}, 1)
+	workers.planAndWaitBlock = make(chan struct{})
+	srv := &Server{registry: registry, workers: workers, logger: logger, sessionTimeout: time.Minute}
+
+	binaryPath := filepath.Join(t.TempDir(), "concurrent.bin")
+	sess, err := registry.Create(binaryPath, time.Minute)
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := workers.Start(context.Background(), sess, binaryPath); err != nil {
+		t.Fatalf("start worker: %v", err)
+	}
+
+	// First call starts analysis and blocks on the worker.
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	defer cancel1()
+	go func() { _, _, _ = srv.runAutoAnalysis(ctx1, nil, RunAutoAnalysisRequest{SessionID: sess.ID}) }()
+	select {
+	case <-workers.planAndWaitStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first auto-analysis did not start")
+	}
+
+	// Second call must not launch a second pass.
+	res, meta, err := srv.runAutoAnalysis(context.Background(), nil, RunAutoAnalysisRequest{SessionID: sess.ID})
+	if err != nil {
+		t.Fatalf("second run_auto_analysis errored: %v", err)
+	}
+	if e, ok := meta.(error); ok {
+		t.Fatalf("second run_auto_analysis user error: %v", e)
+	}
+	payload := decodeContent(t, res)
+	if started, _ := payload["started"].(bool); started {
+		t.Fatalf("second call should report started=false, got %v", payload)
+	}
+	close(workers.planAndWaitBlock)
 }
 
 func TestCleanupExpiredSessionsRechecksAfterInFlightRelease(t *testing.T) {

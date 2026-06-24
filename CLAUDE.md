@@ -85,7 +85,7 @@ Worker communication uses Unix domain sockets (Linux/macOS) or TCP on localhost 
 
 **`addToolWithCache`:** Middleware wrapping `mcp.AddTool` that intercepts responses, stores large outputs (>8KB) in the output cache, and returns truncated previews with a `_cache_id` for pagination via `get_cached_output`.
 
-**Progress streaming:** When an MCP client includes a `progressToken` in its tool call, the server streams `notifications/progress` via SSE: `open_binary` reports loading → analysis → warming → ready stages; analysis tools blocked by the readiness gate report wait progress. Without a token, `open_binary` returns immediately (fire-and-forget, agent polls `get_session_progress`) and readiness-gate errors include the polling hint. `progressReporter.Emit()` drops notifications silently when no token is present.
+**Progress streaming:** `open_binary` and `run_auto_analysis` never block on loading/analysis: the work runs on a detached `context.Background()` goroutine (see `backgroundOpen` / `beginBackgroundAnalysis`) that survives the tool call returning and any client-side per-call timeout — critical for large binaries whose analysis outlasts the MCP client's deadline. The agent polls `get_session_progress`, which a heartbeat refreshes every few seconds during the otherwise-opaque `plan_and_wait` so liveness is visible. Read/analysis tools still stream wait-progress: when a `progressToken` is present and the session isn't ready, `resolveClientWait` blocks and streams `notifications/progress` via SSE until ready. `progressReporter.Emit()` drops notifications silently when no token is present. (Mid-call streaming from `open_binary` itself is intentionally not used — the Streamable HTTP transport runs in JSON-response mode.)
 
 **Dispatch pattern:** Consolidated tools (e.g., `query`) accept a discriminator field (`category`, `mode`, `action`, `target`, `format`), validate it, construct the appropriate inner request struct, and delegate to the existing handler. The inner handlers remain unchanged.
 
@@ -101,7 +101,7 @@ Tools register in three tiers: Tier 0 (boot: `open_binary`, `list_sessions`, `ge
 
 ### Session lifecycle
 
-1. `open_binary` → spawns Python worker, creates session in Registry, saves metadata to Store, promotes to Tier 1. When the client provides an MCP `progressToken`, blocks and streams progress (loading → analysis → warming → ready) via SSE; without a token, returns immediately and loads in the background (agent polls `get_session_progress`).
+1. `open_binary` → spawns Python worker, creates session in Registry, saves metadata to Store, promotes to Tier 1. Returns immediately; loading + auto-analysis + cache warming run on a detached background goroutine (agent polls `get_session_progress` until `ready=true`). The detached context means a large binary whose load/analysis outlasts the client's tool-call timeout still completes.
 2. `RestoreSessions()` on startup → reloads persisted sessions from Store, reconnects to running workers
 3. `Watchdog()` goroutine → periodically checks for expired sessions and closes them
 4. `close_binary` → stops worker, removes from Registry/Store, demotes to Tier 0 if no sessions remain

@@ -26,3 +26,27 @@ func TestReleaseInFlightRefreshesIdleDeadline(t *testing.T) {
 		t.Fatal("release should refresh idle deadline so the session is not immediately expired")
 	}
 }
+
+func TestAnalysisGuardCAS(t *testing.T) {
+	t.Parallel()
+
+	sess := &Session{}
+	if !sess.TryBeginAnalysis() {
+		t.Fatal("first claim should succeed")
+	}
+	if sess.TryBeginAnalysis() {
+		t.Fatal("second claim should fail while analysis is active")
+	}
+	if !sess.AnalysisActive() {
+		t.Fatal("expected AnalysisActive to report true while claimed")
+	}
+
+	sess.EndAnalysis()
+	if sess.AnalysisActive() {
+		t.Fatal("expected AnalysisActive to report false after EndAnalysis")
+	}
+	if !sess.TryBeginAnalysis() {
+		t.Fatal("claim should succeed again after release")
+	}
+	sess.EndAnalysis()
+}

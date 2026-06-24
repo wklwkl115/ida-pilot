@@ -182,8 +182,8 @@ The surface is intentionally small: related operations are consolidated behind a
 
 | Tool | Description |
 |------|-------------|
-| `run_auto_analysis` | Trigger IDA auto-analysis (for binaries opened with `skip_analysis`) |
-| `watch_auto_analysis` | Stream auto-analysis progress |
+| `run_auto_analysis` | Trigger IDA auto-analysis (for binaries opened with `skip_analysis`). Returns once analysis finishes, or — for a long analysis that outlasts the call — promptly with `status:"analyzing"` while it continues in the background; poll `get_session_progress` until `ready=true` |
+| `watch_auto_analysis` | Observe auto-analysis progress (does not drive or cancel it) |
 | `set_analysis_note` / `get_analysis_context` | Server-side context tracking for state recovery |
 | `prune_context` | Clear cached outputs + noted-function caches to free memory |
 | `py_eval` *(opt-in)* | Execute Python in IDA — registered only with `--enable-py-eval`. Invalidates caches after each call (`read_only=true` to keep them warm). See [Security model](#%EF%B8%8F-security-model--read-before-exposing-the-port). |

@@ -174,34 +174,14 @@ func (s *Server) openBinary(ctx context.Context, req *mcp.CallToolRequest, args 
 
 	autoAnalyze := !args.SkipAnalysis
 
-	// When the client provides a progress token, loading + auto-analysis + cache
-	// warming runs inline and streams progress notifications via the MCP SSE
-	// transport. Without a token, open_binary returns immediately and the agent
-	// polls get_session_progress (backward-compatible fire-and-forget).
-	if progressToken := req.Params.GetProgressToken(); progressToken != nil {
-		progress := s.progressReporter(ctx, req, sess.ID, "loading")
-		s.emitProgress(progress, sess.ID, "starting", "Starting worker", 0, 4)
-		s.backgroundOpen(sess, client, args.Path, autoAnalyze, progress, ctx)
-
-		result := map[string]any{
-			"session_id":       sess.ID,
-			"binary_path":      args.Path,
-			"created_at":       sess.CreatedAt.Unix(),
-			"status":           "ready",
-			"analysis_pending": autoAnalyze,
-			"auto_running":     false,
-			"message":          "Session ready — call survey_binary for a one-call overview",
-		}
-		s.enrichSessionResult(ctx, sess.ID, result)
-		jsonResult, _ := json.Marshal(result)
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{
-				&mcp.TextContent{Text: string(jsonResult)},
-			},
-		}, nil, nil
-	}
-
-	// Fire-and-forget: loading runs in the background.
+	// Loading + auto-analysis + cache warming run on a DETACHED context so they
+	// survive this tool call returning AND any client-side per-call timeout: a
+	// 200MB binary can take far longer to load+analyze than the MCP client's
+	// tool-call deadline, and the worker's IDA thread can't be interrupted
+	// mid-analysis anyway. The agent polls get_session_progress until
+	// ready=true. Mid-call progress streaming is intentionally not attempted:
+	// the Streamable HTTP transport runs in JSON-response mode, so interim
+	// notifications wouldn't reach the client during the call regardless.
 	s.recordProgress(sess.ID, "opening", "Loading binary into IDA", 1, 4)
 	go s.backgroundOpen(sess, client, args.Path, autoAnalyze, nil, context.Background())
 
@@ -273,18 +253,17 @@ func (s *Server) backgroundOpen(sess *session.Session, client *worker.WorkerClie
 
 	var warning string
 	if autoAnalyze {
-		s.emitProgress(progress, sess.ID, "analyzing", "Running auto-analysis", 2, 4)
-		planResp, planErr := (*client.SessionCtrl).PlanAndWait(bgCtx, connect.NewRequest(&pb.PlanAndWaitRequest{}))
-		if planErr != nil {
-			warning = fmt.Sprintf("auto-analysis failed: %v", planErr)
-			s.logger.Printf("[open_binary] session=%s auto-analysis failed: %v", sess.ID, planErr)
-		} else if planResp.Msg != nil && !planResp.Msg.GetSuccess() {
-			warning = fmt.Sprintf("auto-analysis error: %s", planResp.Msg.GetError())
-			s.logger.Printf("[open_binary] session=%s auto-analysis error: %s", sess.ID, planResp.Msg.GetError())
+		// Guard so a concurrent run_auto_analysis can't launch a second pass.
+		// A fresh open always wins the claim; the rare loser just skips (someone
+		// else is already analyzing this session).
+		if sess.TryBeginAnalysis() {
+			ok, msg, _ := s.executeAnalysisWithHeartbeat(sess, client)
+			sess.EndAnalysis()
+			if !ok {
+				warning = msg
+				s.logger.Printf("[open_binary] session=%s %s", sess.ID, msg)
+			}
 		}
-	}
-
-	if autoAnalyze {
 		s.warmSessionCache(sess.ID, progress)
 	}
 
@@ -300,6 +279,108 @@ func (s *Server) backgroundOpen(sess *session.Session, client *worker.WorkerClie
 		readyMsg += " (" + warning + ")"
 	}
 	s.emitProgress(progress, sess.ID, "ready", readyMsg, 4, 4)
+}
+
+// analysisHeartbeatInterval is how often a heartbeat refreshes the progress
+// snapshot while plan_and_wait blocks the worker's single IDA thread. IDA's
+// auto_wait() is one opaque blocking call with no sub-progress, so the heartbeat
+// reports elapsed time — enough for get_session_progress to show liveness (fresh
+// last_updated_ago) and for a streaming client to keep its timeout alive.
+const analysisHeartbeatInterval = 5 * time.Second
+
+// analysisResult is the outcome of a background auto-analysis pass.
+type analysisResult struct {
+	success  bool
+	duration float64
+	errMsg   string
+}
+
+// executeAnalysisWithHeartbeat runs plan_and_wait on a DETACHED context while a
+// heartbeat goroutine refreshes the "analyzing" progress snapshot. It blocks
+// until analysis finishes and returns (success, errMsg, durationSeconds). It
+// deliberately uses context.Background() rather than any request context: a
+// client tool-call timeout must never abort an analysis the worker can't
+// interrupt anyway. The caller owns cache invalidation and the terminal stage.
+func (s *Server) executeAnalysisWithHeartbeat(sess *session.Session, client *worker.WorkerClient) (bool, string, float64) {
+	start := time.Now()
+	s.recordProgress(sess.ID, "analyzing", "Running auto-analysis", 2, 4)
+
+	stop := make(chan struct{})
+	hbDone := make(chan struct{})
+	go func() {
+		defer close(hbDone)
+		ticker := time.NewTicker(analysisHeartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				elapsed := time.Since(start).Round(time.Second)
+				s.recordProgress(sess.ID, "analyzing",
+					fmt.Sprintf("Auto-analysis running (%s elapsed)", elapsed), 2, 4)
+			}
+		}
+	}()
+
+	resp, err := (*client.SessionCtrl).PlanAndWait(context.Background(), connect.NewRequest(&pb.PlanAndWaitRequest{}))
+
+	// Stop the heartbeat and wait for it to exit before returning, so no stale
+	// "analyzing" write can land after the caller records the terminal stage.
+	close(stop)
+	<-hbDone
+
+	if err != nil {
+		return false, fmt.Sprintf("auto-analysis failed: %v", err), 0
+	}
+	if resp.Msg != nil && !resp.Msg.GetSuccess() {
+		return false, fmt.Sprintf("auto-analysis error: %s", resp.Msg.GetError()), 0
+	}
+	var duration float64
+	if resp.Msg != nil {
+		duration = resp.Msg.GetDurationSeconds()
+	}
+	return true, "", duration
+}
+
+// beginBackgroundAnalysis starts an auto-analysis pass on a detached goroutine
+// if one isn't already running for this session, returning a buffered completion
+// channel and true. If analysis is already in flight it returns (nil, false).
+//
+// The analysis — and the post-analysis cache invalidation + progress
+// bookkeeping — always runs to completion regardless of any request context, so
+// a client tool-call timeout can't abort it. Callers that want the result race
+// the returned channel against their own ctx; abandoning the channel is safe
+// because it is buffered.
+func (s *Server) beginBackgroundAnalysis(sess *session.Session, client *worker.WorkerClient) (<-chan analysisResult, bool) {
+	if !sess.TryBeginAnalysis() {
+		return nil, false
+	}
+	done := make(chan analysisResult, 1)
+	// A dedicated in-flight lease keeps the watchdog off this session until the
+	// analysis goroutine finishes — independent of the request's own lease,
+	// which is released as soon as the tool call returns.
+	sess.AcquireInFlight()
+	go func() {
+		defer sess.ReleaseInFlight()
+		defer sess.EndAnalysis()
+		success, errMsg, duration := s.executeAnalysisWithHeartbeat(sess, client)
+		if success {
+			// Auto-analysis rewrites the function set, xrefs, etc. Invalidate the
+			// cache BEFORE signaling so a caller that observes `done` (and any
+			// read it issues next) sees fresh data.
+			s.deleteSessionCache(sess.ID)
+			s.recordProgress(sess.ID, "ready", "Session ready (analysis complete)", 4, 4)
+		} else {
+			msg := errMsg
+			if msg == "" {
+				msg = "auto-analysis failed"
+			}
+			s.recordProgress(sess.ID, "failed", msg, 0, 4)
+		}
+		done <- analysisResult{success: success, duration: duration, errMsg: errMsg}
+	}()
+	return done, true
 }
 
 func (s *Server) closeBinary(ctx context.Context, req *mcp.CallToolRequest, args CloseBinaryRequest) (*mcp.CallToolResult, any, error) {
@@ -474,95 +555,62 @@ func (s *Server) runAutoAnalysis(ctx context.Context, req *mcp.CallToolRequest, 
 		return nil, err, nil
 	}
 
-	progress := s.progressReporter(ctx, req, sess.ID, "auto_analysis")
-	s.emitProgress(progress, sess.ID, "auto_analysis", "Running plan_and_wait", 0, 0)
-
-	type planResult struct {
-		resp *pb.PlanAndWaitResponse
-		err  error
+	done, started := s.beginBackgroundAnalysis(sess, client)
+	if !started {
+		// Analysis is already running (open_binary's auto pass, or a prior
+		// run_auto_analysis). Don't start a second pass or block — point the
+		// agent at polling.
+		return autoAnalysisResult(map[string]any{
+			"session_id": sess.ID,
+			"status":     "analyzing",
+			"started":    false,
+			"running":    true,
+			"message":    "Auto-analysis already running — poll get_session_progress until ready=true",
+		}), nil, nil
 	}
 
-	planCh := make(chan planResult, 1)
-	go func() {
-		resp, err := (*client.SessionCtrl).PlanAndWait(ctx, connect.NewRequest(&pb.PlanAndWaitRequest{}))
-		if err != nil {
-			planCh <- planResult{err: err}
-			return
+	// Wait for completion, but only as long as THIS request is alive. The
+	// analysis runs on a detached context, so a client-side tool-call timeout
+	// (which cancels ctx) no longer aborts it — we just hand back a "still
+	// running" result and the work continues, observable via
+	// get_session_progress with a live heartbeat.
+	select {
+	case res := <-done:
+		payload := map[string]any{
+			"session_id":       sess.ID,
+			"status":           "ready",
+			"started":          true,
+			"success":          res.success,
+			"duration_seconds": res.duration,
+			"message":          "Auto-analysis complete",
 		}
-		planCh <- planResult{resp: resp.Msg}
-	}()
-
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
-	start := time.Now()
-	updates := make([]map[string]any, 0, 32)
-	var lastState string
-	var lastRunning bool
-	var planResp *pb.PlanAndWaitResponse
-
-	fetchInfo := func() {
-		infoResp, err := (*client.SessionCtrl).GetSessionInfo(ctx, connect.NewRequest(&pb.GetSessionInfoRequest{}))
-		if err != nil || infoResp.Msg == nil {
-			return
-		}
-		lastState = infoResp.Msg.GetAutoState()
-		lastRunning = infoResp.Msg.GetAutoRunning()
-		entry := map[string]any{
-			"timestamp":       time.Now().Unix(),
-			"auto_state":      lastState,
-			"auto_running":    lastRunning,
-			"session_id":      sess.ID,
-			"elapsed_seconds": time.Since(start).Seconds(),
-		}
-		updates = append(updates, entry)
-		s.emitProgress(progress, sess.ID, "auto_analysis", fmt.Sprintf("auto_state=%s running=%t", lastState, lastRunning), 0, 0)
-	}
-
-loop:
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, s.logAndReturnError("run_auto_analysis", ctx.Err()), nil
-		case pr := <-planCh:
-			if pr.err != nil {
-				s.emitProgress(progress, sess.ID, "auto_analysis", fmt.Sprintf("plan_and_wait failed: %v", pr.err), 0, 0)
-				return nil, s.logAndReturnError("run_auto_analysis plan_and_wait", pr.err), nil
+		if !res.success {
+			payload["status"] = "failed"
+			payload["message"] = res.errMsg
+			if res.errMsg == "" {
+				payload["message"] = "auto-analysis failed"
 			}
-			planResp = pr.resp
-			fetchInfo()
-			break loop
-		case <-ticker.C:
-			fetchInfo()
 		}
+		return autoAnalysisResult(payload), nil, nil
+	case <-ctx.Done():
+		return autoAnalysisResult(map[string]any{
+			"session_id": sess.ID,
+			"status":     "analyzing",
+			"started":    true,
+			"running":    true,
+			"message":    "Auto-analysis still running in the background — poll get_session_progress until ready=true",
+		}), nil, nil
 	}
+}
 
-	s.emitProgress(progress, sess.ID, "auto_analysis", "Auto-analysis complete", 1, 1)
-
-	s.deleteSessionCache(sess.ID)
-
-	resultPayload := map[string]any{
-		"session_id":       sess.ID,
-		"duration_seconds": 0.0,
-		"updates":          updates,
-		"update_count":     len(updates),
-		"success":          planResp != nil && planResp.GetSuccess(),
-		"auto_state":       lastState,
-		"auto_running":     lastRunning,
-	}
-	if planResp != nil {
-		resultPayload["duration_seconds"] = planResp.GetDurationSeconds()
-		if errMsg := planResp.GetError(); errMsg != "" {
-			resultPayload["error"] = errMsg
-		}
-	}
-
-	result, _ := json.Marshal(resultPayload)
+// autoAnalysisResult marshals a run_auto_analysis payload into a tool result.
+func autoAnalysisResult(payload map[string]any) *mcp.CallToolResult {
+	body, _ := json.Marshal(payload)
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{
-			&mcp.TextContent{Text: string(result)},
+			&mcp.TextContent{Text: string(body)},
 		},
-	}, nil, nil
+	}
 }
 
 func (s *Server) watchAutoAnalysis(ctx context.Context, req *mcp.CallToolRequest, args WatchAutoAnalysisRequest) (*mcp.CallToolResult, any, error) {

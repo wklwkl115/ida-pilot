@@ -27,6 +27,11 @@ type Session struct {
 	// Release refreshes LastActivity so the idle timeout starts when the
 	// operation finishes, not when it began.
 	inFlight atomic.Int64
+	// analysisActive guards auto-analysis so only one plan_and_wait pass runs
+	// per session at a time (open_binary's auto-analysis vs. a concurrent
+	// run_auto_analysis call). It is independent of inFlight, which counts every
+	// kind of worker op.
+	analysisActive atomic.Bool
 }
 
 // Touch updates last activity timestamp
@@ -60,6 +65,23 @@ func (s *Session) ReleaseInFlight() {
 // call (decomp on a huge function, for example) isn't torn down mid-flight.
 func (s *Session) HasInFlight() bool {
 	return s.inFlight.Load() > 0
+}
+
+// TryBeginAnalysis atomically claims the auto-analysis slot, returning true if
+// the caller now owns it. A false return means analysis is already running, so
+// the caller should not start a second pass. Pair a true return with EndAnalysis.
+func (s *Session) TryBeginAnalysis() bool {
+	return s.analysisActive.CompareAndSwap(false, true)
+}
+
+// EndAnalysis releases the auto-analysis slot claimed by TryBeginAnalysis.
+func (s *Session) EndAnalysis() {
+	s.analysisActive.Store(false)
+}
+
+// AnalysisActive reports whether an auto-analysis pass is currently running.
+func (s *Session) AnalysisActive() bool {
+	return s.analysisActive.Load()
 }
 
 // Metadata returns the persisted metadata for this session.
