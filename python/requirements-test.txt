@@ -1,5 +1,5 @@
-pytest>=9.0.1
-pytest-timeout>=2.1.0
+pytest>=9.1.1
+pytest-timeout>=2.4.0
 # test_connect_server imports the generated protobuf stubs; keep in sync with
 # the runtime pin in requirements.txt.
-protobuf>=6.33.2
+protobuf>=7.35.1
